@@ -149,3 +149,54 @@ echo "== 19. 再次关账：更正与反向作为独立流水进入本批，历�
 curl -s -X POST "$BASE/closes" -H 'Content-Type: application/json' -d '{
   "request_id": "CLOSE-2026-11"
 }' | fmt
+
+echo "== 20. 渠道对账：批次号 + 入账序号区间 (起点,终点] + 渠道逐笔回单 =="
+echo "    只比对区间内原销售/退款；更正与价差反向不参与；退款净价取原销售入账价"
+# 此时入账序号：1=S100, 2=RF100, 3=S101, 4=S102, 5=RF101, 6=COR-2026-10-001, 7=RF102, 8=反向流水
+# 取 (0, 8] 全区间；RC-3 册数故意报错，RC-X 为空回单（渠道多报）
+curl -s -X POST "$BASE/reconciliations" -H 'Content-Type: application/json' -d '{
+  "batch_id": "RECON-2026-11-001",
+  "channel": "amazon",
+  "start_seq": 0,
+  "end_seq": 8,
+  "receipts": [
+    {"receipt_id": "RC-1", "entry_type": "sale",   "internal_ref_id": "S100", "copies": 1200, "net_price": 33.33},
+    {"receipt_id": "RC-2", "entry_type": "refund", "internal_ref_id": "RF100", "copies": 250, "net_price": 33.33},
+    {"receipt_id": "RC-3", "entry_type": "sale",   "internal_ref_id": "S101", "copies": 4,    "net_price": 20.00},
+    {"receipt_id": "RC-4", "entry_type": "sale",   "internal_ref_id": "S102", "copies": 10,   "net_price": 20.00},
+    {"receipt_id": "RC-5", "entry_type": "refund", "internal_ref_id": "RF101", "copies": 10,  "net_price": 33.33},
+    {"receipt_id": "RC-6", "entry_type": "refund", "internal_ref_id": "RF102", "copies": 100, "net_price": 33.33},
+    {"receipt_id": "RC-X", "entry_type": "sale",   "internal_ref_id": null,    "copies": 1,   "net_price": 9.99}
+  ]
+}' | fmt
+
+echo "== 21. 同批次号同内容重试（200，冻结原报告）；按批次号查询；批次列表 =="
+curl -s -o /dev/null -w 'replay status: %{http_code}\n' -X POST "$BASE/reconciliations" \
+  -H 'Content-Type: application/json' -d '{
+    "batch_id": "RECON-2026-11-001", "channel": "amazon", "start_seq": 0, "end_seq": 8,
+    "receipts": [
+      {"receipt_id": "RC-1", "entry_type": "sale",   "internal_ref_id": "S100",  "copies": 1200, "net_price": 33.33},
+      {"receipt_id": "RC-2", "entry_type": "refund", "internal_ref_id": "RF100", "copies": 250,  "net_price": 33.33},
+      {"receipt_id": "RC-3", "entry_type": "sale",   "internal_ref_id": "S101",  "copies": 4,    "net_price": 20.00},
+      {"receipt_id": "RC-4", "entry_type": "sale",   "internal_ref_id": "S102",  "copies": 10,   "net_price": 20.00},
+      {"receipt_id": "RC-5", "entry_type": "refund", "internal_ref_id": "RF101", "copies": 10,   "net_price": 33.33},
+      {"receipt_id": "RC-6", "entry_type": "refund", "internal_ref_id": "RF102", "copies": 100,  "net_price": 33.33},
+      {"receipt_id": "RC-X", "entry_type": "sale",   "internal_ref_id": null,    "copies": 1,    "net_price": 9.99}
+    ]
+  }'
+curl -s "$BASE/reconciliations/RECON-2026-11-001" | fmt
+curl -s "$BASE/reconciliations" | fmt
+
+echo "== 22. 整批拒绝示例：回单号重复 / 区间越界 → 422（不落库、不冻结）=="
+curl -s -o /dev/null -w 'dup receipt: %{http_code}\n' -X POST "$BASE/reconciliations" \
+  -H 'Content-Type: application/json' -d '{
+    "batch_id": "RECON-BAD", "channel": "amazon", "start_seq": 0, "end_seq": 8,
+    "receipts": [
+      {"receipt_id": "DUP", "entry_type": "sale", "internal_ref_id": "S100", "copies": 1, "net_price": 1},
+      {"receipt_id": "DUP", "entry_type": "sale", "internal_ref_id": "S101", "copies": 1, "net_price": 1}
+    ]
+  }'
+curl -s -o /dev/null -w 'out of range: %{http_code}\n' -X POST "$BASE/reconciliations" \
+  -H 'Content-Type: application/json' -d '{
+    "batch_id": "RECON-BAD2", "channel": "amazon", "start_seq": 0, "end_seq": 999999, "receipts": []
+  }'

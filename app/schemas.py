@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -131,3 +132,63 @@ class PaymentIn(BaseModel):
     close_id: int = Field(gt=0)
     payment_id: str = Field(min_length=1, max_length=128)
     amount_cents: int = Field(gt=0)
+
+
+class ReconcileReceiptIn(BaseModel):
+    """渠道逐笔回单。空回单（internal_ref_id 为 None）同样提交，用于核查内部漏报。
+
+    - receipt_id 批内唯一；entry_type 为销售或退款；
+    - copies 为正整数；net_price 为每册净价（元，非负）；
+    - 退款净价须为原销售入账价（系统按原销售入账价比对）。
+    """
+
+    receipt_id: str = Field(min_length=1, max_length=128)
+    entry_type: Literal["sale", "refund"]
+    internal_ref_id: str | None = Field(default=None, max_length=128)
+    copies: int = Field(gt=0)
+    net_price: Decimal = Field(ge=0, description="每册净价（元）")
+
+    @field_validator("internal_ref_id")
+    @classmethod
+    def _empty_to_none(cls, v):
+        # 空回单：null 或空串均视为"内部流水编号缺失"
+        if v is not None and v.strip() == "":
+            return None
+        return v
+
+    @field_validator("net_price", mode="before")
+    @classmethod
+    def _price(cls, v):
+        return _norm_decimal(v)
+
+
+class ReconciliationIn(BaseModel):
+    """渠道对账提交：全局唯一批次号 + 入账序号区间 (start_seq, end_seq] + 渠道 + 逐笔回单。
+
+    整批拒绝（不落库、不冻结）的情形：
+    - 同一内部流水编号在回单中出现多次（同 entry_type 下）；
+    - 回单号 receipt_id 批内重复；
+    - 区间越界（end<=start，或 end 超过当前最大入账序号）；
+    - 数值非法（copies<=0、净价为负等，由字段校验拦截）。
+    空回单列表允许提交：用于核查该区间是否存在内部漏报。
+    """
+
+    batch_id: str = Field(min_length=1, max_length=128)
+    channel: str = Field(min_length=1, max_length=128)
+    start_seq: int = Field(ge=0, description="入账序号区间起点（不含）")
+    end_seq: int = Field(ge=0, description="入账序号区间终点（含）")
+    receipts: list[ReconcileReceiptIn] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _check(self):
+        receipt_ids = [r.receipt_id for r in self.receipts]
+        if len(set(receipt_ids)) != len(receipt_ids):
+            raise ValueError("回单号在批内重复")
+        keys = [
+            (r.entry_type, r.internal_ref_id)
+            for r in self.receipts
+            if r.internal_ref_id is not None
+        ]
+        if len(set(keys)) != len(keys):
+            raise ValueError("同一内部流水编号在批内出现多次")
+        return self

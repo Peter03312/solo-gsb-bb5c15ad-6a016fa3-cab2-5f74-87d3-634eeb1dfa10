@@ -13,6 +13,7 @@ from .schemas import (
     CloseIn,
     PaymentIn,
     PriceCorrectionIn,
+    ReconciliationIn,
     RefundIn,
     SaleIn,
     SplitChangeIn,
@@ -28,8 +29,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="数字出版版税结算服务",
-    version="1.3.0",
-    description="阶梯版税计提、作者分成版本、退款冲销、净价更正、关账报表与关账后付款结算",
+    version="1.4.0",
+    description="阶梯版税计提、作者分成版本、退款冲销、净价更正、关账报表、关账后付款结算与渠道对账",
     lifespan=lifespan,
 )
 
@@ -41,7 +42,7 @@ async def api_error_handler(request, exc: ApiError):
 
 @app.get("/", summary="服务信息")
 def root():
-    return {"service": "数字出版版税结算服务", "version": "1.3.0", "docs": "/docs"}
+    return {"service": "数字出版版税结算服务", "version": "1.4.0", "docs": "/docs"}
 
 
 @app.get("/health", summary="健康检查")
@@ -192,3 +193,28 @@ def get_payment(payment_id: str):
 @app.get("/authors/{author_id}/settlement", summary="作者结算总览（分批应计/已付/负余额/可付/付款记录）")
 def get_author_settlement(author_id: str):
     return ledger.author_settlement(author_id)
+
+
+# ---------------------------------------------------------------- 渠道对账
+
+
+@app.post(
+    "/reconciliations",
+    status_code=201,
+    summary="提交渠道对账（全局唯一批次号 + 入账序号区间 (起点,终点] + 逐笔回单，成功报告冻结）",
+)
+def create_reconciliation(payload: ReconciliationIn, response: Response):
+    body, created = ledger.submit_reconciliation(payload)
+    if not created:  # 同批次号同内容重试 → 返回冻结原报告
+        response.status_code = 200
+    return body
+
+
+@app.get("/reconciliations", summary="对账批次列表（不含逐笔明细）")
+def list_reconciliations():
+    return ledger.list_reconciliations()
+
+
+@app.get("/reconciliations/{batch_id}", summary="按批次号查询冻结对账报告")
+def get_reconciliation(batch_id: str):
+    return ledger.get_reconciliation(batch_id)

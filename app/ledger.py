@@ -47,6 +47,21 @@
   "未退总额分账之差"望远镜式计算，保证全退后该销售逐作者累计价差恰为 0；
   无已生效价差时不产生反向流水；旧退款不追溯；
 - 更正与退款、关账并发时，一律按提交顺序（数据库提交顺序）判定未退册数与批次归属。
+
+渠道对账（只读，绝不改写任何账务数据）：
+- 财务以全局唯一批次号、入账序号区间 (start_seq, end_seq]（左开右闭）、渠道与
+  逐笔回单提交；回单含批内唯一回单号、销售/退款类型、内部流水编号（可空）、册数、
+  每册净价；空回单（无内部编号）也须提交，按渠道多报呈现，用于核查内部漏报；
+- 只以区间内的"原销售"与"退款"两类流水为准：净价更正与价差反向流水不参与；
+  退款的内部净价取原销售入账价（净价更正不改变对账用原价）；
+- 逐笔结论：matched（一致）/ copies_or_price_mismatch（册数或净价不符）/
+  channel_extra（渠道多报：回单无对应区间内内部流水，含空回单与区间外引用）/
+  internal_missing（内部漏报：区间内内部流水无对应回单）；报告给出双方原值与汇总；
+- 整批拒绝（不落库）：同一内部流水编号在回单中多次出现、回单号批内重复、
+  区间越界（end<=start 或 end 超过当前最大入账序号）、数值非法；
+- 核对与保存基于同一数据快照（同一把锁、同一 BEGIN IMMEDIATE 事务），成功报告
+  冻结；后续补录、退款、更正均不改旧报告；同批次号同内容重试返回原报告（200），
+  同批次号异内容冲突（409）。
 """
 from __future__ import annotations
 
@@ -57,7 +72,15 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
 
 from .db import LOCK, get_conn
-from .schemas import PaymentIn, PriceCorrectionIn, RefundIn, SaleIn, SplitChangeIn, WorkIn
+from .schemas import (
+    PaymentIn,
+    PriceCorrectionIn,
+    ReconciliationIn,
+    RefundIn,
+    SaleIn,
+    SplitChangeIn,
+    WorkIn,
+)
 
 CENT = Decimal("0.01")
 HUNDRED = Decimal(100)
@@ -1440,3 +1463,338 @@ def author_settlement(author_id: str) -> dict:
                 )
             ],
         }
+
+
+# ---------------------------------------------------------------- 渠道对账
+#
+# 结论状态：
+# - matched                册数与每册净价均一致
+# - copies_or_price_mismatch 内部流水存在，但册数或每册净价不符
+# - channel_extra          渠道多报：回单在区间内无对应内部流水
+#                          （含空回单、内部编号不存在、编号存在但不在区间内、类型不符）
+# - internal_missing       内部漏报：区间内内部流水没有任何回单引用
+RECON_STATUSES = (
+    "matched",
+    "copies_or_price_mismatch",
+    "channel_extra",
+    "internal_missing",
+)
+
+
+def _reconciliation_fingerprint(p: ReconciliationIn) -> str:
+    """对账提交内容指纹：批次号 + 渠道 + 区间 + 回单（保持回单提交顺序）。"""
+    return _fingerprint(
+        {
+            "batch_id": p.batch_id,
+            "channel": p.channel,
+            "start_seq": p.start_seq,
+            "end_seq": p.end_seq,
+            "receipts": [
+                {
+                    "receipt_id": r.receipt_id,
+                    "entry_type": r.entry_type,
+                    "internal_ref_id": r.internal_ref_id,
+                    "copies": r.copies,
+                    "net_price": dec_str(r.net_price),
+                }
+                for r in p.receipts
+            ],
+        }
+    )
+
+
+def _rejection(msg: str) -> ApiError:
+    """整批拒绝：内容语义不合法（不落库、不冻结）。"""
+    return ApiError(422, msg)
+
+
+def _load_interval_entries(conn: sqlite3.Connection, start_seq: int, end_seq: int) -> dict:
+    """读取区间 (start_seq, end_seq] 内参与对账的内部原销售/退款流水（同一快照）。
+
+    净价更正与价差反向流水不参与对账；退款净价取原销售入账价。
+    返回 {(entry_type, ref_id): 内部流水 dict}。
+    """
+    sales = conn.execute(
+        "SELECT s.sale_id AS ref_id, s.entry_seq, s.copies, s.net_price"
+        " FROM sales s JOIN entries e ON e.entry_seq=s.entry_seq"
+        " WHERE e.entry_seq>? AND e.entry_seq<=?",
+        (start_seq, end_seq),
+    ).fetchall()
+    internal: dict[tuple[str, str], dict] = {}
+    for s in sales:
+        internal[("sale", s["ref_id"])] = {
+            "ref_id": s["ref_id"],
+            "entry_seq": s["entry_seq"],
+            "copies": s["copies"],
+            "net_price": s["net_price"],
+        }
+    refunds = conn.execute(
+        "SELECT r.refund_id AS ref_id, r.entry_seq, r.copies, s.net_price AS net_price"
+        " FROM refunds r JOIN entries e ON e.entry_seq=r.entry_seq"
+        " JOIN sales s ON s.sale_id=r.sale_id"
+        " WHERE e.entry_seq>? AND e.entry_seq<=?",
+        (start_seq, end_seq),
+    ).fetchall()
+    for r in refunds:
+        internal[("refund", r["ref_id"])] = {
+            "ref_id": r["ref_id"],
+            "entry_seq": r["entry_seq"],
+            "copies": r["copies"],
+            "net_price": r["net_price"],
+        }
+    return internal
+
+
+def _build_reconciliation_report(
+    conn: sqlite3.Connection, p: ReconciliationIn, created_at: str
+) -> dict:
+    """在同一数据快照上完成逐笔核对并组装冻结报告（不落库）。"""
+    internal = _load_interval_entries(conn, p.start_seq, p.end_seq)
+    receipts = list(p.receipts)
+
+    # 回单引用的内部流水是否真实存在（不限区间、不限类型）——用于区分多报原因
+    existing_refs: set[tuple[str, str]] = set()
+    sale_ids = {
+        r.internal_ref_id
+        for r in receipts
+        if r.entry_type == "sale" and r.internal_ref_id is not None
+    }
+    if sale_ids:
+        placeholders = ",".join("?" * len(sale_ids))
+        for row in conn.execute(
+            f"SELECT sale_id FROM sales WHERE sale_id IN ({placeholders})",
+            tuple(sale_ids),
+        ):
+            existing_refs.add(("sale", row["sale_id"]))
+    refund_ids = {
+        r.internal_ref_id
+        for r in receipts
+        if r.entry_type == "refund" and r.internal_ref_id is not None
+    }
+    if refund_ids:
+        placeholders = ",".join("?" * len(refund_ids))
+        for row in conn.execute(
+            f"SELECT refund_id FROM refunds WHERE refund_id IN ({placeholders})",
+            tuple(refund_ids),
+        ):
+            existing_refs.add(("refund", row["refund_id"]))
+
+    lines: list[dict] = []
+    referenced: set[tuple[str, str]] = set()
+    summary: dict = {}
+    for status in RECON_STATUSES:
+        summary[status] = {
+            "count": 0,
+            "channel_copies": 0,
+            "internal_copies": 0,
+            "channel_gross_cents": {"sale": 0, "refund": 0},
+            "internal_gross_cents": {"sale": 0, "refund": 0},
+        }
+
+    def add(line: dict, status: str, channel_copies: int, internal_copies: int,
+            channel_amt: int, internal_amt: int, etype: str) -> None:
+        lines.append(line)
+        st = summary[status]
+        st["count"] += 1
+        st["channel_copies"] += channel_copies
+        st["internal_copies"] += internal_copies
+        st["channel_gross_cents"][etype] += channel_amt
+        st["internal_gross_cents"][etype] += internal_amt
+
+    # ---- 逐笔回单核对（保持提交顺序）----
+    for idx, r in enumerate(receipts):
+        key = (r.entry_type, r.internal_ref_id) if r.internal_ref_id is not None else None
+        base = {
+            "status": None,
+            "entry_type": r.entry_type,
+            "receipt_id": r.receipt_id,
+            "receipt_index": idx,
+            "internal_ref_id": r.internal_ref_id,
+            "channel": {
+                "copies": r.copies,
+                # 渠道回单原值：保留提交时的写法（10.00 不归并为 10），便于逐笔核对
+                "net_price": format(r.net_price, "f"),
+                "gross_cents": per_copy_cents(r.net_price, Decimal(1)) * r.copies,
+            },
+            "internal": None,
+        }
+        ch_amt = base["channel"]["gross_cents"]
+        if key is not None and key in internal:
+            referenced.add(key)
+            it = internal[key]
+            internal_price = Decimal(it["net_price"])
+            base["internal"] = {
+                "entry_seq": it["entry_seq"],
+                "copies": it["copies"],
+                "net_price": it["net_price"],
+                "gross_cents": per_copy_cents(internal_price, Decimal(1)) * it["copies"],
+            }
+            in_amt = base["internal"]["gross_cents"]
+            if r.copies == it["copies"] and r.net_price == internal_price:
+                base["status"] = "matched"
+                add(base, "matched", r.copies, it["copies"], ch_amt, in_amt, r.entry_type)
+            else:
+                base["status"] = "copies_or_price_mismatch"
+                add(base, "copies_or_price_mismatch", r.copies, it["copies"],
+                    ch_amt, in_amt, r.entry_type)
+        else:
+            # 渠道多报：空回单 / 内部编号不存在 / 存在但不在区间或类型不符
+            base["status"] = "channel_extra"
+            if key is None:
+                base["reason"] = "empty_receipt"
+            elif key not in existing_refs:
+                base["reason"] = "internal_not_found"
+            else:
+                base["reason"] = "outside_interval"
+            add(base, "channel_extra", r.copies, 0, ch_amt, 0, r.entry_type)
+
+    # ---- 内部漏报：区间内无任何回单引用的原销售/退款（按入账序号）----
+    missing = [
+        (key, it) for key, it in internal.items() if key not in referenced
+    ]
+    missing.sort(key=lambda x: x[1]["entry_seq"])
+    for key, it in missing:
+        etype, ref_id = key
+        internal_price = Decimal(it["net_price"])
+        in_amt = per_copy_cents(internal_price, Decimal(1)) * it["copies"]
+        line = {
+            "status": "internal_missing",
+            "entry_type": etype,
+            "receipt_id": None,
+            "receipt_index": None,
+            "internal_ref_id": ref_id,
+            "channel": None,
+            "internal": {
+                "entry_seq": it["entry_seq"],
+                "copies": it["copies"],
+                "net_price": it["net_price"],
+                "gross_cents": in_amt,
+            },
+        }
+        add(line, "internal_missing", 0, it["copies"], 0, in_amt, etype)
+
+    channel_totals = {"sale": 0, "refund": 0}
+    internal_totals = {"sale": 0, "refund": 0}
+    for st in summary.values():
+        for etype in ("sale", "refund"):
+            channel_totals[etype] += st["channel_gross_cents"][etype]
+            internal_totals[etype] += st["internal_gross_cents"][etype]
+
+    return {
+        "batch_id": p.batch_id,
+        "channel": p.channel,
+        "start_seq": p.start_seq,
+        "end_seq": p.end_seq,
+        "entry_seq_from": p.start_seq + 1,
+        "entry_seq_to": p.end_seq,
+        "created_at": created_at,
+        "receipts_count": len(receipts),
+        "internal_entries_count": len(internal),
+        "status_counts": {status: summary[status]["count"] for status in RECON_STATUSES},
+        "lines": lines,
+        "summary": {
+            status: {
+                "count": summary[status]["count"],
+                "channel_copies": summary[status]["channel_copies"],
+                "internal_copies": summary[status]["internal_copies"],
+                "channel_gross_cents": dict(summary[status]["channel_gross_cents"]),
+                "internal_gross_cents": dict(summary[status]["internal_gross_cents"]),
+            }
+            for status in RECON_STATUSES
+        },
+        "channel_totals": {
+            "sale_gross_cents": channel_totals["sale"],
+            "refund_gross_cents": channel_totals["refund"],
+        },
+        "internal_totals": {
+            "sale_gross_cents": internal_totals["sale"],
+            "refund_gross_cents": internal_totals["refund"],
+        },
+    }
+
+
+def submit_reconciliation(p: ReconciliationIn) -> tuple[dict, bool]:
+    """提交渠道对账。返回 (冻结报告, 是否新建)。
+
+    整批拒绝（422，不落库）：区间越界（end<=start、end 超过当前最大入账序号）。
+    回单重复/数值非法已在请求模型层拦截；同批次号同内容重放优先（200）。
+    """
+    fp = _reconciliation_fingerprint(p)
+    with LOCK:
+        conn = get_conn()
+        # 幂等优先：同批次号同内容重试返回冻结原报告（即使区间此刻已越界）
+        row = conn.execute(
+            "SELECT report, fingerprint FROM reconciliations WHERE batch_id=?",
+            (p.batch_id,),
+        ).fetchone()
+        if row is not None:
+            if row["fingerprint"] != fp:
+                raise _conflict(f"对账批次 {p.batch_id} 已存在且提交内容不一致")
+            return json.loads(row["report"]), False
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if p.end_seq <= p.start_seq:
+                raise _rejection(
+                    f"入账序号区间非法：({p.start_seq}, {p.end_seq}] 要求 start < end"
+                )
+            max_seq = conn.execute(
+                "SELECT COALESCE(MAX(entry_seq),0) AS c FROM entries"
+            ).fetchone()["c"]
+            if p.end_seq > max_seq:
+                raise _rejection(
+                    f"区间终点 {p.end_seq} 超过当前最大入账序号 {max_seq}"
+                )
+            report = _build_reconciliation_report(conn, p, _utcnow())
+            conn.execute(
+                "INSERT INTO reconciliations(batch_id, channel, start_seq, end_seq,"
+                " fingerprint, report, created_at) VALUES(?,?,?,?,?,?,?)",
+                (
+                    p.batch_id,
+                    p.channel,
+                    p.start_seq,
+                    p.end_seq,
+                    fp,
+                    json.dumps(report, ensure_ascii=False),
+                    report["created_at"],
+                ),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        return report, True
+
+
+def get_reconciliation(batch_id: str) -> dict:
+    """按批次号读取冻结对账报告；后续补录/退款/更正均不改变报告内容。"""
+    with LOCK:
+        row = get_conn().execute(
+            "SELECT report FROM reconciliations WHERE batch_id=?", (batch_id,)
+        ).fetchone()
+        if row is None:
+            raise _not_found(f"对账批次 {batch_id} 不存在")
+        return json.loads(row["report"])
+
+
+def list_reconciliations() -> dict:
+    """对账批次列表（按创建顺序），不含逐笔明细。"""
+    with LOCK:
+        rows = get_conn().execute(
+            "SELECT report FROM reconciliations ORDER BY rowid"
+        ).fetchall()
+        items = []
+        for r in rows:
+            rep = json.loads(r["report"])
+            items.append(
+                {
+                    "batch_id": rep["batch_id"],
+                    "channel": rep["channel"],
+                    "entry_seq_from": rep["entry_seq_from"],
+                    "entry_seq_to": rep["entry_seq_to"],
+                    "receipts_count": rep["receipts_count"],
+                    "internal_entries_count": rep["internal_entries_count"],
+                    "status_counts": rep["status_counts"],
+                    "created_at": rep["created_at"],
+                }
+            )
+        return {"reconciliations": items}

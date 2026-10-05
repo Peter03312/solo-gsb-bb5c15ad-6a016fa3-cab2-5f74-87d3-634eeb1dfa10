@@ -1,6 +1,6 @@
 # 数字出版版税结算服务
 
-基于 **Python / FastAPI + SQLite** 的版税结算服务：作品阶梯费率管理、作者分成版本管理、销售入账计提、作者分账、退款冲销、**销售净价更正（价差补提/冲回）**、关账批次报表，支持幂等重试与并发安全。
+基于 **Python / FastAPI + SQLite** 的版税结算服务：作品阶梯费率管理、作者分成版本管理、销售入账计提、作者分账、退款冲销、**销售净价更正（价差补提/冲回）**、关账批次报表、**渠道回单对账（冻结报告）**，支持幂等重试与并发安全。
 
 ## 快速启动
 
@@ -57,6 +57,7 @@ Compose 默认将宿主机 `8000` 映射到容器 `8000`，数据持久化在命
 - **负余额（待抵扣）**：关账后退款若使应计额低于已付额，差额记为作者的待抵扣负余额，**后续关账的正额先抵扣**，旧报表与旧付款均不改写；负余额未清零时可付额为 0，不能付款。
 - **幂等**：作品 / 分成变更 / 销售 / 退款 / **净价更正** / 付款以唯一编号为准——同号同内容重试返回原结果（HTTP 200），同号异内容拒绝（HTTP 409）；付款的同号同内容重试**即使之后又有关账也返回原结算结果**（响应为提交时刻的快照）。关账可携带 `request_id` 作为幂等键。
 - **并发**：所有入账、分成变更、关账与结算写操作在进程内串行化并在单事务中提交（`BEGIN IMMEDIATE`），版本生效与批次归属由**数据库提交顺序**决定，并发变更与入账有确定先后，并发结算不会超付。
+- **渠道对账（只读冻结）**：财务以**全局唯一批次号**、**入账序号区间 `(起点, 终点]`（左开右闭）**、**渠道**与**逐笔回单**（批内唯一回单号、销售/退款类型、内部流水编号、册数、每册净价）提交。**空回单**（无内部编号）同样提交，在报告中按"渠道多报"呈现，用于核查漏报。只以区间内的**原销售与退款**流水为准——**净价更正与价差反向流水不参与**；退款的内部净价取**原销售入账价**（更正不改对账用原价）。逐笔给出 `matched`（一致）/ `copies_or_price_mismatch`（册数或净价不符）/ `channel_extra`（渠道多报，含空回单、内部编号不存在、引用区间外流水或类型不符）/ `internal_missing`（内部漏报：区间内流水无回单），并给出**双方原值与分状态/分类型汇总**。**整批拒绝（422，不落库）**：同一内部流水编号多次出现、回单号批内重复、区间越界（`end<=start` 或 `end` 超过当前最大入账序号）、数值非法。**核对与保存基于同一数据快照**（同一把锁、同一事务），成功报告**冻结**；后续补录、退款、更正**不改旧报告**。同批次号同内容重试返回原报告（HTTP 200），同批次号异内容冲突（HTTP 409）。对账**不改写**销售、退款、关账与付款的任何数据。
 
 ## API 一览
 
@@ -81,6 +82,9 @@ Compose 默认将宿主机 `8000` 映射到容器 `8000`，数据持久化在命
 | POST | `/payments` | 提交作者付款结算（仅当前最新关账批次） |
 | GET | `/payments/{payment_id}` | 查询单笔付款结算 |
 | GET | `/authors/{author_id}/settlement` | 作者结算总览：分批应计、已付、负余额、可付、付款记录 |
+| POST | `/reconciliations` | 提交渠道对账（批次号全局唯一 + 区间 `(start,end]` + 逐笔回单，成功即冻结） |
+| GET | `/reconciliations` | 对账批次列表（不含逐笔明细） |
+| GET | `/reconciliations/{batch_id}` | 按批次号读取冻结对账报告（含逐笔双方原值与汇总） |
 
 金额单位：响应中 `*_cents` 字段均为**分**；`net_price` 为元（字符串原样返回，避免浮点误差）。
 
@@ -368,6 +372,125 @@ curl -X POST http://localhost:8000/closes -H 'Content-Type: application/json' -d
 | 409 | 同变更编号异内容（含变更编号跨作品复用） |
 | 422 | 请求体校验失败（作者编号重复 / 比例为负 / 合计不为 100 / 空作者列表） |
 
+## 渠道对账
+
+财务与渠道按入账序号区间逐笔核对。对账**只读**销售/退款数据：不产生流水、不占用入账序号、
+不改写销售、退款、关账与付款的任何数据；净价更正与价差反向流水**不参与**，退款净价始终取
+**原销售入账价**。
+
+### 提交
+
+`POST /reconciliations`
+
+```json
+{
+  "batch_id": "RECON-2026-11-001",
+  "channel": "amazon",
+  "start_seq": 0,
+  "end_seq": 8,
+  "receipts": [
+    {"receipt_id": "RC-1", "entry_type": "sale",   "internal_ref_id": "S100",  "copies": 1200, "net_price": 33.33},
+    {"receipt_id": "RC-2", "entry_type": "refund", "internal_ref_id": "RF100", "copies": 250,  "net_price": 33.33},
+    {"receipt_id": "RC-3", "entry_type": "sale",   "internal_ref_id": "S101",  "copies": 4,    "net_price": 20.00},
+    {"receipt_id": "RC-X", "entry_type": "sale",   "internal_ref_id": null,    "copies": 1,    "net_price": 9.99}
+  ]
+}
+```
+
+字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `batch_id` | 对账批次号，**全局唯一**（幂等键） |
+| `channel` | 渠道标识（如 `amazon`） |
+| `start_seq` / `end_seq` | 入账序号区间，**左开右闭** `(start_seq, end_seq]`；`end_seq` 不得超过当前最大入账序号 |
+| `receipts[].receipt_id` | 回单号，**批内唯一** |
+| `receipts[].entry_type` | `sale`（销售）或 `refund`（退款） |
+| `receipts[].internal_ref_id` | 内部流水编号（销售 `sale_id` / 退款 `refund_id`）；`null` 或空串为**空回单** |
+| `receipts[].copies` | 回单册数，正整数 |
+| `receipts[].net_price` | 回单每册净价（元，非负，字符串/数字均可）；退款应为原销售入账价 |
+
+- 空回单列表允许提交（仅核查区间内是否有内部漏报）。
+- `net_price` 数值比较按十进制等值（渠道 `10.00` 与内部 `10` 判为一致）；报告中渠道侧保留回单提交数值的写法（JSON 数字尾随 0 在解析后不保留，如数字 `20.00` 展示为 `20.0`；如需精确保留格式请以字符串 `"20.00"` 提交），内部侧为入账原值。
+- 金额 `gross_cents`（分）= 每册净价（元）× 册数 ×100，每册价格本身**不再乘费率**（对账核对的是渠道与内部的净价/册数原值，不是计提版税）。
+
+### 逐笔结论
+
+| 状态 | 含义 |
+| --- | --- |
+| `matched` | 区间内存在同类型同编号内部流水，且册数、每册净价均一致 |
+| `copies_or_price_mismatch` | 内部流水存在，但册数或每册净价不符（`channel`/`internal` 双方原值并列） |
+| `channel_extra` | 渠道多报：无对应区间内内部流水。`reason`：`empty_receipt`（空回单）/ `internal_not_found`（编号不存在或类型不符）/ `outside_interval`（编号存在但不在区间） |
+| `internal_missing` | 内部漏报：区间内的原销售/退款没有任何回单引用（`receipt_id` 与 `channel` 为 `null`，按入账序号排列） |
+
+### 响应示例（节选）
+
+```json
+{
+  "batch_id": "RECON-2026-11-001",
+  "channel": "amazon",
+  "start_seq": 0, "end_seq": 8,
+  "entry_seq_from": 1, "entry_seq_to": 8,
+  "receipts_count": 4,
+  "internal_entries_count": 6,
+  "status_counts": {"matched": 2, "copies_or_price_mismatch": 1, "channel_extra": 1, "internal_missing": 3},
+  "lines": [
+    {"status": "matched", "entry_type": "sale", "receipt_id": "RC-1", "receipt_index": 0,
+     "internal_ref_id": "S100",
+     "channel":  {"copies": 1200, "net_price": "33.33", "gross_cents": 3999600},
+     "internal": {"entry_seq": 1, "copies": 1200, "net_price": "33.33", "gross_cents": 3999600}},
+    {"status": "matched", "entry_type": "refund", "receipt_id": "RC-2", "receipt_index": 1,
+     "internal_ref_id": "RF100",
+     "channel":  {"copies": 250, "net_price": "33.33", "gross_cents": 833250},
+     "internal": {"entry_seq": 2, "copies": 250, "net_price": "33.33", "gross_cents": 833250}},
+    {"status": "copies_or_price_mismatch", "entry_type": "sale", "receipt_id": "RC-3",
+     "receipt_index": 2, "internal_ref_id": "S101",
+     "channel":  {"copies": 4, "net_price": "20.0", "gross_cents": 8000},
+     "internal": {"entry_seq": 3, "copies": 5, "net_price": "20",    "gross_cents": 10000}},
+    {"status": "channel_extra", "entry_type": "sale", "receipt_id": "RC-X",
+     "receipt_index": 3, "internal_ref_id": null, "reason": "empty_receipt",
+     "channel": {"copies": 1, "net_price": "9.99", "gross_cents": 999}, "internal": null},
+    {"status": "internal_missing", "entry_type": "sale", "receipt_id": null,
+     "receipt_index": null, "internal_ref_id": "S102", "channel": null,
+     "internal": {"entry_seq": 4, "copies": 10, "net_price": "20", "gross_cents": 20000}},
+    {"status": "internal_missing", "entry_type": "refund", "receipt_id": null,
+     "receipt_index": null, "internal_ref_id": "RF101", "channel": null,
+     "internal": {"entry_seq": 5, "copies": 10, "net_price": "33.33", "gross_cents": 33330}},
+    {"status": "internal_missing", "entry_type": "refund", "receipt_id": null,
+     "receipt_index": null, "internal_ref_id": "RF102", "channel": null,
+     "internal": {"entry_seq": 7, "copies": 100, "net_price": "33.33", "gross_cents": 333300}}
+  ],
+  "summary": {
+    "matched": {"count": 2, "channel_copies": 1450, "internal_copies": 1450,
+                "channel_gross_cents": {"sale": 3999600, "refund": 833250},
+                "internal_gross_cents": {"sale": 3999600, "refund": 833250}},
+    "internal_missing": {"count": 3, "channel_copies": 0, "internal_copies": 120,
+                "channel_gross_cents": {"sale": 0, "refund": 0},
+                "internal_gross_cents": {"sale": 20000, "refund": 366630}}
+  },
+  "channel_totals":  {"sale_gross_cents": 4008599, "refund_gross_cents": 833250},
+  "internal_totals": {"sale_gross_cents": 4029600, "refund_gross_cents": 1199880}
+}
+```
+
+`summary` 对四种状态分别给出笔数、双方册数与分销售/退款的毛额合计；顶层
+`channel_totals` / `internal_totals` 为全部状态分类型毛额合计。
+
+### 冻结与幂等
+
+- 核对与保存基于**同一数据快照**（全局锁 + `BEGIN IMMEDIATE` 单事务）；提交成功后报告整体冻结落库。
+- 报告成功后再补录销售/退款、提交更正、关账或付款，`GET /reconciliations/{batch_id}` 返回内容不变。
+- 同 `batch_id` 同内容重试：HTTP **200** 返回原冻结报告；同 `batch_id` 异内容：HTTP **409**。
+- 列表：`GET /reconciliations`（仅批次元信息与 `status_counts`，不含逐笔明细）。
+
+### 错误码（渠道对账）
+
+| 状态码 | 场景 |
+| --- | --- |
+| 404 | `GET /reconciliations/{batch_id}` 批次不存在 |
+| 409 | 同批次号异内容重试 |
+| 422 | 区间越界（`end<=start` 或 `end` 超过当前最大入账序号）；回单号批内重复；同一内部流水编号在批内多次出现；册数非正/净价为负等数值非法（**整批拒绝，不落库**） |
+
 ## 测试
 
 ```bash
@@ -375,9 +498,19 @@ pip install -r requirements-dev.txt
 pytest tests/ -q
 ```
 
-覆盖：阶梯计提、分账余分补齐、退款跨段冲回与超退拦截、幂等重试与冲突、关账批次归属与报表不可改、付款结算（过期批次拒绝/超付拦截/幂等重放/负余额抵扣）、并发入账、关账与结算，作者分成版本（校验/幂等与全局冲突/版本查询/入账版本/旧销售退款按原版本分账/退出作者结算/并发变更与入账/旧库迁移），以及净价更正（各档未退册数差额与独立分账相减/正负差额/幂等与全局冲突/销售不存在·已全退·同价拒绝/更正后退款的价差反向流水与原字段不变/串联更正与全退逐作者归零/更正与反向进入下一批次且历史不改写/按更正编号查询/并发提交顺序/旧库迁移新流水类型）。
+覆盖：阶梯计提、分账余分补齐、退款跨段冲回与超退拦截、幂等重试与冲突、关账批次归属与报表不可改、付款结算（过期批次拒绝/超付拦截/幂等重放/负余额抵扣）、并发入账、关账与结算，作者分成版本（校验/幂等与全局冲突/版本查询/入账版本/旧销售退款按原版本分账/退出作者结算/并发变更与入账/旧库迁移），净价更正（各档未退册数差额与独立分账相减/正负差额/幂等与全局冲突/销售不存在·已全退·同价拒绝/更正后退款的价差反向流水与原字段不变/串联更正与全退逐作者归零/更正与反向进入下一批次且历史不改写/按更正编号查询/并发提交顺序/旧库迁移新流水类型），以及渠道对账（四种逐笔状态与双方原值/空回单与内部漏报/左开右闭区间与越界拒绝/更正不参与且退款取原销售价/类型不符多报/整批拒绝不落库/幂等重放与异内容冲突/报告冻结不改旧报告/只读不改账务数据/与入账并发）。
 
-## 本轮变动（v1.3.0）
+## 本轮变动（v1.4.0）
+
+- **新增渠道对账**：`POST /reconciliations` 提交（全局唯一批次号 + 入账序号区间 `(start_seq,end_seq]` + 渠道 + 逐笔回单），`GET /reconciliations/{batch_id}` 读取冻结报告，`GET /reconciliations` 批次列表。
+- **核对口径**：只以区间内**原销售与退款**为准，净价更正与价差反向流水不参与；退款净价取**原销售入账价**；空回单（无内部编号）按渠道多报呈现，用于核查内部漏报。
+- **逐笔结论**：`matched` / `copies_or_price_mismatch` / `channel_extra`（含原因 `empty_receipt` / `internal_not_found` / `outside_interval`）/ `internal_missing`，每笔给出渠道与内部双方的册数、每册净价、毛额（分），并按状态×类型给出汇总。
+- **整批拒绝**：同一内部流水编号多次出现、回单号批内重复、区间越界、数值非法一律 422 且不落库不冻结。
+- **快照冻结与幂等**：核对与保存同一数据快照（全局锁 + 单事务）；成功后报告冻结，后续补录、退款、更正、关账、付款均不改旧报告；同批次号同内容重试 200 返回原报告，异内容 409。
+- **零侵入**：对账只读既有账务表、不产生流水、不占用入账序号；既有接口字段、状态码与启动方式均不变。
+- **存储**：新增 `reconciliations` 表（冻结报告 JSON 落库），`CREATE TABLE IF NOT EXISTS` 幂等建表，旧库启动自动可用，无需迁移既有表。
+
+## 历史变动（v1.3.0）
 
 - **新增销售净价更正**：`POST /price-corrections`（更正编号全局唯一、幂等），`GET /price-corrections/{correction_id}` 按更正编号查询，`GET /price-corrections` 列表（可 `?sale_id=` 过滤）。
 - **差额口径**：按**原销售阶梯费率与入账时分成版本**，仅对各档**未退册数**计算新旧每册净价的版税差额（四舍五入到分）；逐作者差额为"新价未退总额分账 − 旧价未退总额分账"（两个总额各自整体分账后相减）。旧价取当前更正价，支持多次串联更正。

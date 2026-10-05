@@ -1081,3 +1081,309 @@ def test_migration_accepts_new_entry_kinds(tmp_path):
             {"author_id": "A1", "amount_cents": 0},
             {"author_id": "A2", "amount_cents": 0},
         ]
+
+
+# ---------------------------------------------------------------- 渠道对账
+
+
+def reconcile(client, batch_id, start_seq, end_seq, receipts, channel="amazon"):
+    return client.post(
+        "/reconciliations",
+        json={
+            "batch_id": batch_id,
+            "channel": channel,
+            "start_seq": start_seq,
+            "end_seq": end_seq,
+            "receipts": receipts,
+        },
+    )
+
+
+def rc(receipt_id, entry_type, internal_ref_id, copies, price):
+    return {
+        "receipt_id": receipt_id,
+        "entry_type": entry_type,
+        "internal_ref_id": internal_ref_id,
+        "copies": copies,
+        "net_price": price,
+    }
+
+
+def _two_sales_and_refund(client):
+    make_work(client)
+    make_sale(client, "S1", copies=10, price="10.00")   # entry_seq 1
+    make_sale(client, "S2", copies=5, price="20.00")    # entry_seq 2
+    client.post("/refunds", json={"refund_id": "R1", "sale_id": "S1", "copies": 2})  # seq 3
+    return 3
+
+
+def test_reconciliation_statuses_and_original_values(client):
+    max_seq = _two_sales_and_refund(client)
+    r = reconcile(client, "B1", 0, max_seq, [
+        rc("r1", "sale", "S1", 10, "10.00"),     # 一致（字符串 10.00 与内部 10 等值）
+        rc("r2", "sale", "S2", 4, "20.00"),      # 册数不符
+        rc("r3", "refund", "R1", 2, "10.00"),    # 退款净价取原销售入账价
+        rc("r4", "sale", "NOPE", 1, "9.99"),     # 内部编号不存在 → 多报
+        rc("r5", "sale", None, 3, "5.00"),       # 空回单 → 多报
+    ])
+    assert r.status_code == 201
+    rep = r.json()
+    assert rep["status_counts"] == {
+        "matched": 2,
+        "copies_or_price_mismatch": 1,
+        "channel_extra": 2,
+        "internal_missing": 0,
+    }
+    by_id = {l["receipt_id"]: l for l in rep["lines"]}
+    assert by_id["r1"]["status"] == "matched"
+    assert by_id["r1"]["channel"] == {"copies": 10, "net_price": "10.00", "gross_cents": 10000}
+    assert by_id["r1"]["internal"] == {
+        "entry_seq": 1, "copies": 10, "net_price": "10", "gross_cents": 10000
+    }
+    assert by_id["r2"]["status"] == "copies_or_price_mismatch"
+    assert by_id["r2"]["channel"]["copies"] == 4 and by_id["r2"]["internal"]["copies"] == 5
+    assert by_id["r2"]["channel"]["gross_cents"] == 8000
+    assert by_id["r2"]["internal"]["gross_cents"] == 10000
+    assert by_id["r3"]["status"] == "matched"  # 退款按原销售价 10.00
+    assert by_id["r4"]["status"] == "channel_extra" and by_id["r4"]["reason"] == "internal_not_found"
+    assert by_id["r4"]["internal"] is None
+    assert by_id["r5"]["status"] == "channel_extra" and by_id["r5"]["reason"] == "empty_receipt"
+    # 汇总
+    assert rep["channel_totals"] == {"sale_gross_cents": 20499, "refund_gross_cents": 2000}
+    assert rep["internal_totals"] == {"sale_gross_cents": 20000, "refund_gross_cents": 2000}
+    assert rep["summary"]["copies_or_price_mismatch"]["internal_copies"] == 5
+    assert rep["summary"]["channel_extra"]["channel_copies"] == 4
+
+
+def test_reconciliation_price_mismatch(client):
+    max_seq = _two_sales_and_refund(client)
+    r = reconcile(client, "B1", 0, max_seq, [
+        rc("r1", "sale", "S1", 10, "9.90"),  # 净价不符
+        rc("r2", "sale", "S2", 5, "20.00"),
+        rc("r3", "refund", "R1", 2, "10.00"),
+    ])
+    assert r.status_code == 201
+    line = r.json()["lines"][0]
+    assert line["status"] == "copies_or_price_mismatch"
+    assert line["channel"]["net_price"] == "9.90" and line["internal"]["net_price"] == "10"
+
+
+def test_reconciliation_internal_missing(client):
+    max_seq = _two_sales_and_refund(client)
+    # 只回 S1、R1：S2 无回单 → 内部漏报
+    r = reconcile(client, "B1", 0, max_seq, [
+        rc("r1", "sale", "S1", 10, "10.00"),
+        rc("r3", "refund", "R1", 2, "10.00"),
+    ])
+    rep = r.json()
+    assert rep["status_counts"]["internal_missing"] == 1
+    line = next(l for l in rep["lines"] if l["status"] == "internal_missing")
+    assert line["entry_type"] == "sale" and line["internal_ref_id"] == "S2"
+    assert line["receipt_id"] is None and line["channel"] is None
+    assert line["internal"] == {"entry_seq": 2, "copies": 5, "net_price": "20", "gross_cents": 10000}
+
+
+def test_reconciliation_empty_receipts_all_missing(client):
+    max_seq = _two_sales_and_refund(client)
+    r = reconcile(client, "B1", 0, max_seq, [])
+    assert r.status_code == 201
+    rep = r.json()
+    assert rep["receipts_count"] == 0
+    assert rep["status_counts"]["internal_missing"] == 3
+    assert rep["internal_totals"] == {"sale_gross_cents": 20000, "refund_gross_cents": 2000}
+    assert rep["channel_totals"] == {"sale_gross_cents": 0, "refund_gross_cents": 0}
+
+
+def test_reconciliation_interval_is_half_open_and_bounded(client):
+    _two_sales_and_refund(client)  # seqs 1..3
+    make_sale(client, "S3", copies=1, price="1.00")  # seq 4
+    # 区间 (1,3]：seq1 的 S1 不在内（虽被回单引用 → 多报 outside_interval），
+    # seq4 的 S3 不在内（不构成漏报）；seq2/seq3 在内
+    r = reconcile(client, "B1", 1, 3, [
+        rc("r1", "sale", "S1", 10, "10.00"),
+        rc("r2", "sale", "S2", 5, "20.00"),
+        rc("r3", "refund", "R1", 2, "10.00"),
+    ])
+    assert r.status_code == 201
+    rep = r.json()
+    assert rep["internal_entries_count"] == 2
+    by_id = {l["receipt_id"]: l for l in rep["lines"]}
+    assert by_id["r1"]["status"] == "channel_extra"
+    assert by_id["r1"]["reason"] == "outside_interval"
+    assert rep["status_counts"]["internal_missing"] == 0
+    # 区间终点越界 / 非左开右闭 → 整批 422
+    assert reconcile(client, "B2", 0, 999, []).status_code == 422
+    assert reconcile(client, "B3", 2, 2, []).status_code == 422
+
+
+def test_reconciliation_excludes_corrections_and_uses_original_price(client):
+    _two_sales_and_refund(client)  # S1=10.00
+    # 更正后再退款：对账仍只看原销售/退款，退款净价仍为原销售价，更正与反向不参与
+    assert correct_price(client, "C1", "S1", "12.00").status_code == 201
+    r = client.post("/refunds", json={"refund_id": "R2", "sale_id": "S1", "copies": 1})
+    assert r.status_code == 201 and r.json()["price_delta_reversal"] is not None
+    max_seq = int(r.json()["price_delta_reversal"]["entry_seq"])
+    rep = reconcile(client, "B1", 0, max_seq, []).json()
+    # 仅 S1/S2/R1/R2 四条；更正与价差反向均不出现
+    assert rep["internal_entries_count"] == 4
+    missing = {l["internal_ref_id"]: l for l in rep["lines"]}
+    assert set(missing) == {"S1", "S2", "R1", "R2"}
+    assert missing["R2"]["internal"]["net_price"] == "10"  # 退款取原销售入账价
+    assert missing["R2"]["entry_type"] == "refund"
+
+
+def test_reconciliation_type_mismatch_is_channel_extra(client):
+    max_seq = _two_sales_and_refund(client)
+    # 退款编号按销售类型提交 → 区间内无对应内部流水 → 多报；R1 同时记为漏报
+    r = reconcile(client, "B1", 0, max_seq, [
+        rc("r1", "sale", "S1", 10, "10.00"),
+        rc("r2", "sale", "S2", 5, "20.00"),
+        rc("rx", "sale", "R1", 2, "10.00"),
+    ])
+    rep = r.json()
+    assert rep["status_counts"] == {
+        "matched": 2,
+        "copies_or_price_mismatch": 0,
+        "channel_extra": 1,
+        "internal_missing": 1,
+    }
+    rx = next(l for l in rep["lines"] if l["receipt_id"] == "rx")
+    assert rx["status"] == "channel_extra" and rx["reason"] == "internal_not_found"
+
+
+def test_reconciliation_rejects_invalid_batch(client):
+    max_seq = _two_sales_and_refund(client)
+    good_receipts = [
+        rc("r1", "sale", "S1", 10, "10.00"),
+        rc("r2", "sale", "S2", 5, "20.00"),
+        rc("r3", "refund", "R1", 2, "10.00"),
+    ]
+    # 回单号批内重复
+    r = reconcile(client, "BAD", 0, max_seq, good_receipts + [rc("r1", "sale", "S2", 1, "1")])
+    assert r.status_code == 422
+    # 同一内部流水编号多次出现（同类型）
+    r = reconcile(client, "BAD", 0, max_seq, good_receipts + [rc("rx", "sale", "S1", 1, "1")])
+    assert r.status_code == 422
+    # 数值非法：册数非正、净价为负
+    r = reconcile(client, "BAD", 0, max_seq, [rc("r1", "sale", "S1", 0, "10.00")])
+    assert r.status_code == 422
+    r = reconcile(client, "BAD", 0, max_seq, [rc("r1", "sale", "S1", 1, "-1")])
+    assert r.status_code == 422
+    # 整批拒绝不落库：同一批次号修正后可首次成功
+    r = reconcile(client, "BAD", 0, max_seq, good_receipts)
+    assert r.status_code == 201
+
+
+def test_reconciliation_idempotent_replay_conflict_and_freeze(client):
+    max_seq = _two_sales_and_refund(client)
+    payload = {
+        "batch_id": "B1", "channel": "amazon", "start_seq": 0, "end_seq": max_seq,
+        "receipts": [
+            rc("r1", "sale", "S1", 10, "10.00"),
+            rc("r2", "sale", "S2", 5, "20.00"),
+            rc("r3", "refund", "R1", 2, "10.00"),
+        ],
+    }
+    r1 = client.post("/reconciliations", json=payload)
+    assert r1.status_code == 201
+    # 同批次号同内容重试 → 200 返回原冻结报告
+    r2 = client.post("/reconciliations", json=payload)
+    assert r2.status_code == 200 and r2.json() == r1.json()
+    # 同批次号异内容 → 409
+    conflict = dict(payload, channel="jd")
+    assert client.post("/reconciliations", json=conflict).status_code == 409
+    # 后续补录/退款/更正不改旧报告
+    make_sale(client, "S3", copies=9, price="50.00")
+    client.post("/refunds", json={"refund_id": "R9", "sale_id": "S2", "copies": 1})
+    correct_price(client, "C1", "S1", "99.00")
+    got = client.get("/reconciliations/B1")
+    assert got.status_code == 200 and got.json() == r1.json()
+    # 列表与 404
+    lst = client.get("/reconciliations").json()["reconciliations"]
+    assert [x["batch_id"] for x in lst] == ["B1"]
+    assert lst[0]["status_counts"]["matched"] == 3
+    assert client.get("/reconciliations/NOPE").status_code == 404
+
+
+def test_reconciliation_is_read_only(client):
+    max_seq = _two_sales_and_refund(client)
+    before_sale = client.get("/sales/S1").json()
+    before_refund = client.get("/refunds/R1").json()
+    reconcile(client, "B1", 0, max_seq, [
+        rc("r1", "sale", "S1", 99, "99.00"),     # 不符也不改账
+        rc("rX", "sale", "GHOST", 1, "1.00"),
+    ])
+    after_sale = client.get("/sales/S1").json()
+    after_refund = client.get("/refunds/R1").json()
+    assert after_sale == before_sale
+    assert after_refund == before_refund
+    # 关账报表金额与无对账时一致（对账不写任何账务表）
+    report = client.post("/closes", json={"request_id": "C1"}).json()
+    assert report["total_sales_royalty_cents"] == 10 * 80 + 5 * 160  # 8% 档：0.80 / 1.60 每册
+    assert report["total_refund_cents"] == 2 * 80
+
+
+def test_reconciliation_concurrent_with_sale(client):
+    """对账与入账并发：区间按提交时快照冻结，两种先后顺序下报告均自洽。"""
+    make_work(client)
+    make_sale(client, "S1", copies=1, price="10.00")  # seq 1
+    payload = {
+        "batch_id": "B1", "channel": "amazon", "start_seq": 0, "end_seq": 1,
+        "receipts": [rc("r1", "sale", "S1", 1, "10.00")],
+    }
+
+    def post_recon():
+        return client.post("/reconciliations", json=payload)
+
+    def post_sale():
+        return make_sale(client, "S2", copies=1, price="10.00")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda f: f(), [post_recon, post_sale]))
+    recon_resp = next(r for r in results if "status_counts" in r.json())
+    body = recon_resp.json()
+    # 报告只可能含 seq1；seq2 之后补录也不改变冻结结果
+    assert body["status_counts"]["matched"] == 1
+    assert client.get("/reconciliations/B1").json() == body
+
+
+def test_reconciliation_start_at_zero_with_empty_interval(client):
+    """无任何入账时，(0,0] 仍越界；区间必须包含至少一个序号。"""
+    make_work(client)
+    r = reconcile(client, "B1", 0, 0, [])
+    assert r.status_code == 422
+
+
+def test_reconciliation_same_ref_id_different_types(client):
+    """同值编号在不同类型下是不同流水，可分别核对。"""
+    make_work(client)
+    make_sale(client, "X1", copies=2, price="10.00")  # seq 1
+    client.post("/refunds", json={"refund_id": "X1", "sale_id": "X1", "copies": 1})  # seq 2
+    r = reconcile(client, "B1", 0, 2, [
+        rc("r1", "sale", "X1", 2, "10.00"),
+        rc("r2", "refund", "X1", 1, "10.00"),
+    ])
+    assert r.status_code == 201
+    assert r.json()["status_counts"] == {
+        "matched": 2, "copies_or_price_mismatch": 0, "channel_extra": 0, "internal_missing": 0
+    }
+
+
+def test_reconciliation_works_after_close_and_payment(client):
+    """对账随时可提交（不依赖关账），且关账/付款后旧对账报告仍冻结。"""
+    max_seq = _two_sales_and_refund(client)
+    client.post("/closes", json={"request_id": "C1"})
+    payload = {
+        "batch_id": "B1", "channel": "amazon", "start_seq": 0, "end_seq": max_seq,
+        "receipts": [
+            rc("r1", "sale", "S1", 10, "10.00"),
+            rc("r2", "sale", "S2", 5, "20.00"),
+            rc("r3", "refund", "R1", 2, "10.00"),
+        ],
+    }
+    r1 = client.post("/reconciliations", json=payload)
+    assert r1.status_code == 201
+    client.post("/payments", json={
+        "payment_id": "P1", "author_id": "A1", "close_id": 1, "amount_cents": 10})
+    client.post("/closes")
+    assert client.get("/reconciliations/B1").json() == r1.json()
