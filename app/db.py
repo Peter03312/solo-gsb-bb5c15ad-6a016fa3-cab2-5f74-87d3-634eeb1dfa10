@@ -224,6 +224,28 @@ CREATE TABLE IF NOT EXISTS price_delta_reversal_splits (
     amount_cents INTEGER NOT NULL,  -- 带符号反向金额（可为负）
     PRIMARY KEY (refund_id, author_id)
 );
+
+-- 渠道对账：以全局唯一批次号提交，报告在核对时刻整体快照落库（report JSON），
+-- 之后只读、不随后续补录/退款/更正变化；对账只读取销售/退款数据，不写任何既有业务表。
+-- reconciliations 行仅在批次通过全部整批拒绝校验后写入；被拒绝批次无落库记录，
+-- 修正后可以用同一批次号重新提交；同批次号异内容（指纹不同）→ 409。
+CREATE TABLE IF NOT EXISTS reconciliations (
+    reconciliation_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_no               TEXT NOT NULL UNIQUE,
+    channel                TEXT NOT NULL,
+    from_entry_seq         INTEGER NOT NULL,  -- 区间起点（不含）
+    to_entry_seq           INTEGER NOT NULL,  -- 区间终点（含）
+    max_entry_seq          INTEGER NOT NULL,  -- 提交时刻全局最大入账序号（数据快照边界）
+    receipt_count          INTEGER NOT NULL,
+    internal_count         INTEGER NOT NULL,
+    matched_count          INTEGER NOT NULL,
+    value_mismatch_count   INTEGER NOT NULL,
+    channel_extra_count    INTEGER NOT NULL,
+    internal_missing_count INTEGER NOT NULL,
+    fingerprint            TEXT NOT NULL,
+    report                 TEXT NOT NULL,     -- 冻结报告快照（JSON）
+    created_at             TEXT NOT NULL
+);
 """
 
 

@@ -149,3 +149,51 @@ echo "== 19. 再次关账：更正与反向作为独立流水进入本批，历�
 curl -s -X POST "$BASE/closes" -H 'Content-Type: application/json' -d '{
   "request_id": "CLOSE-2026-11"
 }' | fmt
+
+echo "== 20. 渠道对账：批次号 + 入账序号区间 (from, to] + 渠道逐笔回单 =="
+echo "    区间内仅原销售/退款参与；退款 RF102 净价须按原销售入账价 33.33（更正价 40 不参与）"
+curl -s -X POST "$BASE/reconciliations" -H 'Content-Type: application/json' -d '{
+  "batch_no": "RECON-CHX-2026-11",
+  "channel": "CH-X",
+  "from_entry_seq": 0,
+  "to_entry_seq": 8,
+  "receipts": [
+    {"receipt_no": "RCP-001", "type": "sale",   "ref_id": "S100", "copies": 1200, "net_price": 33.33},
+    {"receipt_no": "RCP-002", "type": "refund", "ref_id": "RF100", "copies": 250,  "net_price": 33.33},
+    {"receipt_no": "RCP-003", "type": "sale",   "ref_id": "S999", "copies": 1,    "net_price": 10.00}
+  ]
+}' | fmt
+
+echo "== 21. 同批次号同内容重试（回单顺序无关）→ 200 返回同一冻结报告；异内容 → 409 =="
+curl -s -o /dev/null -w 'replay status: %{http_code}\n' -X POST "$BASE/reconciliations" \
+  -H 'Content-Type: application/json' -d '{
+    "batch_no": "RECON-CHX-2026-11", "channel": "CH-X",
+    "from_entry_seq": 0, "to_entry_seq": 8,
+    "receipts": [
+      {"receipt_no": "RCP-003", "type": "sale",   "ref_id": "S999", "copies": 1,    "net_price": 10.00},
+      {"receipt_no": "RCP-002", "type": "refund", "ref_id": "RF100", "copies": 250,  "net_price": 33.33},
+      {"receipt_no": "RCP-001", "type": "sale",   "ref_id": "S100", "copies": 1200, "net_price": 33.33}
+    ]
+  }'
+
+echo "== 22. 空回单批次核查内部漏报（整批回单为空，内部流水全部 internal_missing）=="
+curl -s -X POST "$BASE/reconciliations" -H 'Content-Type: application/json' -d '{
+  "batch_no": "RECON-CHX-EMPTY", "channel": "CH-X",
+  "from_entry_seq": 0, "to_entry_seq": 8, "receipts": []
+}' | fmt
+
+echo "== 23. 整批拒绝示例：区间越界 + 回单号重复（400，不落库，detail 汇总原因）=="
+curl -s -X POST "$BASE/reconciliations" -H 'Content-Type: application/json' -d '{
+  "batch_no": "RECON-BAD", "channel": "CH-X",
+  "from_entry_seq": 0, "to_entry_seq": 999,
+  "receipts": [
+    {"receipt_no": "DUP", "type": "sale", "ref_id": "S100", "copies": 1, "net_price": 10},
+    {"receipt_no": "DUP", "type": "sale", "ref_id": "S101", "copies": 1, "net_price": 10}
+  ]
+}' | fmt
+
+echo "== 24. 查询对账批次列表（可按渠道过滤）/ 按编号 / 按批次号取冻结报告 =="
+curl -s "$BASE/reconciliations" | fmt
+curl -s "$BASE/reconciliations?channel=CH-X" | fmt
+curl -s "$BASE/reconciliations/1" | fmt
+curl -s "$BASE/reconciliations/by-batch/RECON-CHX-2026-11" | fmt

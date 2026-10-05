@@ -2,17 +2,21 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import math
+from decimal import Decimal
 
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Request, Response
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from . import ledger
+from . import ledger, reconciliation
 from .db import init_db
 from .ledger import ApiError
 from .schemas import (
     CloseIn,
     PaymentIn,
     PriceCorrectionIn,
+    ReconciliationIn,
     RefundIn,
     SaleIn,
     SplitChangeIn,
@@ -28,8 +32,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="数字出版版税结算服务",
-    version="1.3.0",
-    description="阶梯版税计提、作者分成版本、退款冲销、净价更正、关账报表与关账后付款结算",
+    version="1.4.0",
+    description="阶梯版税计提、作者分成版本、退款冲销、净价更正、关账报表、关账后付款结算与渠道逐笔对账",
     lifespan=lifespan,
 )
 
@@ -39,9 +43,38 @@ async def api_error_handler(request, exc: ApiError):
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
 
 
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    # pydantic 拦截 NaN/Infinity 时，错误上下文中的 Decimal('NaN') 无法被默认 JSON 序列化，
+    # 这里统一转为可序列化的安全形式（如字符串 "NaN"），保证非法数值稳定返回 422
+    def safe(v):
+        # Decimal（含 NaN/Infinity）无法被标准 JSON 序列化，统一转规范字符串；
+        # 非有限 float 同样转字符串；复杂容器递归处理，其余原样保留
+        if isinstance(v, Decimal):
+            return str(v)
+        if isinstance(v, float) and not math.isfinite(v):
+            return str(v)
+        if isinstance(v, dict):
+            return {k: safe(x) for k, x in v.items()}
+        if isinstance(v, (list, tuple)):
+            return [safe(x) for x in v]
+        return v
+
+    detail = [
+        {
+            "loc": list(e.get("loc", [])),
+            "msg": e.get("msg", ""),
+            "type": e.get("type", ""),
+            "input": safe(e.get("input")),
+        }
+        for e in exc.errors()
+    ]
+    return JSONResponse(status_code=422, content={"detail": detail})
+
+
 @app.get("/", summary="服务信息")
 def root():
-    return {"service": "数字出版版税结算服务", "version": "1.3.0", "docs": "/docs"}
+    return {"service": "数字出版版税结算服务", "version": "1.4.0", "docs": "/docs"}
 
 
 @app.get("/health", summary="健康检查")
@@ -192,3 +225,36 @@ def get_payment(payment_id: str):
 @app.get("/authors/{author_id}/settlement", summary="作者结算总览（分批应计/已付/负余额/可付/付款记录）")
 def get_author_settlement(author_id: str):
     return ledger.author_settlement(author_id)
+
+
+# ---------------------------------------------------------------- 渠道对账
+
+
+@app.post(
+    "/reconciliations",
+    status_code=201,
+    summary="提交渠道对账批次（批次号幂等；区间内仅原销售/退款，退款取原销售入账价）",
+)
+def create_reconciliation(payload: ReconciliationIn, response: Response):
+    body, created = reconciliation.submit_reconciliation(payload)
+    if not created:  # 同批次号同内容重试 → 返回原冻结报告
+        response.status_code = 200
+    return body
+
+
+@app.get("/reconciliations", summary="对账批次列表（可按渠道过滤）")
+def list_reconciliations(channel: str | None = None):
+    return reconciliation.list_reconciliations(channel)
+
+
+@app.get(
+    "/reconciliations/by-batch/{batch_no}",
+    summary="按批次号查询冻结对账报告",
+)
+def get_reconciliation_by_batch(batch_no: str):
+    return reconciliation.get_reconciliation_by_batch(batch_no)
+
+
+@app.get("/reconciliations/{reconciliation_id}", summary="按自增编号查询冻结对账报告")
+def get_reconciliation(reconciliation_id: int):
+    return reconciliation.get_reconciliation(reconciliation_id)

@@ -1,6 +1,6 @@
 # 数字出版版税结算服务
 
-基于 **Python / FastAPI + SQLite** 的版税结算服务：作品阶梯费率管理、作者分成版本管理、销售入账计提、作者分账、退款冲销、**销售净价更正（价差补提/冲回）**、关账批次报表，支持幂等重试与并发安全。
+基于 **Python / FastAPI + SQLite** 的版税结算服务：作品阶梯费率管理、作者分成版本管理、销售入账计提、作者分账、退款冲销、**销售净价更正（价差补提/冲回）**、关账批次报表、**渠道逐笔回单对账（冻结报告）**，支持幂等重试与并发安全。
 
 ## 快速启动
 
@@ -57,6 +57,14 @@ Compose 默认将宿主机 `8000` 映射到容器 `8000`，数据持久化在命
 - **负余额（待抵扣）**：关账后退款若使应计额低于已付额，差额记为作者的待抵扣负余额，**后续关账的正额先抵扣**，旧报表与旧付款均不改写；负余额未清零时可付额为 0，不能付款。
 - **幂等**：作品 / 分成变更 / 销售 / 退款 / **净价更正** / 付款以唯一编号为准——同号同内容重试返回原结果（HTTP 200），同号异内容拒绝（HTTP 409）；付款的同号同内容重试**即使之后又有关账也返回原结算结果**（响应为提交时刻的快照）。关账可携带 `request_id` 作为幂等键。
 - **并发**：所有入账、分成变更、关账与结算写操作在进程内串行化并在单事务中提交（`BEGIN IMMEDIATE`），版本生效与批次归属由**数据库提交顺序**决定，并发变更与入账有确定先后，并发结算不会超付。
+- **渠道对账（v1.4.0 新增）**：财务以**全局唯一批次号**、**入账序号区间 `(from_entry_seq, to_entry_seq]`** 与**渠道**逐笔回单（批内唯一回单号 `receipt_no`、销售/退款类型 `type`、内部流水编号 `ref_id`、册数 `copies`、每册净价 `net_price`）提交对账。
+  - **核对口径**：区间内只以**原销售与原退款**流水为准；**净价更正与价差反向流水不参与**。退款内部侧册数取退款册数、每册净价**一律取原销售入账价**（即使销售后续被更正）。回单类型支持 `sale`/`refund`（兼容中文 `销售`/`退款`）。
+  - **逐笔结论 `status`**：`matched`（一致：册数与净价均相符）、`value_mismatch`（册数或净价不符，行内 `copies_match`/`net_price_match` 指出差异项）、`channel_extra`（渠道多报：回单在区间内无同 `(类型, 内部编号)` 流水，`reason` 为 `not_found` 内部无此编号 / `kind_mismatch` 编号存在但类型不符 / `not_in_interval` 同类型流水存在但序号越出本批区间）、`internal_missing`（内部漏报：区间内有内部流水但渠道未提交对应回单）。每行均给出**双方原值**（`channel`/`internal` 的册数、每册净价、金额分），报告顶层给出**双方各自汇总**（销售/退款笔数、册数、金额与净额 `net_amount_cents`）。
+  - **空回单可核漏报**：整批回单列表可以为空（此时区间内全部内部流水落入内部漏报）；单笔回单允许 `copies=0` 的空回单（仍按类型与内部编号参与匹配，用于核查漏报；金额为 0）。
+  - **整批拒绝（HTTP 400，不落库、不生成报告）**：同一内部流水 `(type, ref_id)` 出现多次、回单号批内重复、区间非正整数长度或终点越过当前最大入账序号（区间越界）；修正后可用同批次号重新提交。请求体数值非法（负数、非有限数、非法类型等）返回 **422**。
+  - **快照与冻结**：核对与保存在**同一数据快照**中完成（持全局锁、单事务读取区间快照并落库）；成功后的报告**冻结**，后续补录、退款或更正**不改变旧报告**。
+  - **幂等与冲突**：同批次号同内容（回单提交顺序无关）重试返回原冻结报告（HTTP 200）；同批次号异内容（区间/渠道/回单不同）拒绝（HTTP 409）。
+  - **只读不改写**：对账只读取销售/退款数据并写入独立的 `reconciliations` 表，**不改写**销售、退款、关账与付款；对账不占用入账序号、不影响关账批次。已有接口字段全部保持兼容。
 
 ## API 一览
 
@@ -81,6 +89,10 @@ Compose 默认将宿主机 `8000` 映射到容器 `8000`，数据持久化在命
 | POST | `/payments` | 提交作者付款结算（仅当前最新关账批次） |
 | GET | `/payments/{payment_id}` | 查询单笔付款结算 |
 | GET | `/authors/{author_id}/settlement` | 作者结算总览：分批应计、已付、负余额、可付、付款记录 |
+| POST | `/reconciliations` | 提交渠道对账批次（批次号幂等；报告核对后冻结落库） |
+| GET | `/reconciliations` | 对账批次列表（可选 `?channel=` 按渠道过滤） |
+| GET | `/reconciliations/{reconciliation_id}` | 按自增编号查询冻结对账报告 |
+| GET | `/reconciliations/by-batch/{batch_no}` | 按批次号查询冻结对账报告 |
 
 金额单位：响应中 `*_cents` 字段均为**分**；`net_price` 为元（字符串原样返回，避免浮点误差）。
 
@@ -265,6 +277,144 @@ curl -X POST http://localhost:8000/closes -H 'Content-Type: application/json' -d
 `total_author_net_cents`（含更正与反向的作者净分账合计）。`lines` 中新增
 `"type": "price_correction"` 与 `"type": "price_delta_reversal"` 两类逐笔明细。
 
+### 渠道对账调用示例（v1.4.0）
+
+```bash
+# 18. 财务提交渠道对账：全局唯一批次号 + 入账序号区间 (from, to] + 渠道逐笔回单
+#     区间内仅核对原销售/退款；退款净价必须按原销售入账价（33.33，而非更正后的 40）
+curl -X POST http://localhost:8000/reconciliations -H 'Content-Type: application/json' -d '{
+  "batch_no": "RECON-CHX-2026-11",
+  "channel": "CH-X",
+  "from_entry_seq": 0,
+  "to_entry_seq": 8,
+  "receipts": [
+    {"receipt_no": "RCP-001", "type": "sale",   "ref_id": "S100", "copies": 1200, "net_price": 33.33},
+    {"receipt_no": "RCP-002", "type": "refund", "ref_id": "RF100", "copies": 250, "net_price": 33.33},
+    {"receipt_no": "RCP-003", "type": "sale",   "ref_id": "S999", "copies": 1,   "net_price": 10.00}
+  ]
+}'
+# → 201：S100 matched；RF100 matched（内部取原销售价 33.33）；
+#        S999 channel_extra(渠道多报，reason=not_found)；区间内其余未回单流水 internal_missing(内部漏报)。
+
+# 19. 空回单列表亦可提交（核查区间内全部内部漏报）；单笔空回单 copies=0 同样合法
+curl -X POST http://localhost:8000/reconciliations -H 'Content-Type: application/json' -d '{
+  "batch_no": "RECON-CHX-EMPTY", "channel": "CH-X",
+  "from_entry_seq": 0, "to_entry_seq": 8, "receipts": []
+}'
+
+# 20. 同批次号同内容重试（回单顺序无关）→ 200 返回同一冻结报告；异内容 → 409
+curl -X POST http://localhost:8000/reconciliations -H 'Content-Type: application/json' -d '{
+  "batch_no": "RECON-CHX-2026-11", "channel": "CH-X",
+  "from_entry_seq": 0, "to_entry_seq": 8,
+  "receipts": [
+    {"receipt_no": "RCP-003", "type": "sale",   "ref_id": "S999", "copies": 1,    "net_price": 10.00},
+    {"receipt_no": "RCP-002", "type": "refund", "ref_id": "RF100", "copies": 250,  "net_price": 33.33},
+    {"receipt_no": "RCP-001", "type": "sale",   "ref_id": "S100", "copies": 1200, "net_price": 33.33}
+  ]
+}'
+
+# 21. 报告冻结：成功后的补录/退款/更正不改旧报告；查询按自增编号或批次号
+curl http://localhost:8000/reconciliations
+curl "http://localhost:8000/reconciliations?channel=CH-X"
+curl http://localhost:8000/reconciliations/1
+curl http://localhost:8000/reconciliations/by-batch/RECON-CHX-2026-11
+```
+
+整批拒绝示例（HTTP 400，`detail` 给出全部原因；不落库、不分配编号，修正后可用同批次号重提）：
+
+```bash
+# 回单号重复 / 同一 (type, ref_id) 多次 / 区间越界（to_entry_seq 超过当前最大入账序号）
+curl -X POST http://localhost:8000/reconciliations -H 'Content-Type: application/json' -d '{
+  "batch_no": "RECON-BAD", "channel": "CH-X",
+  "from_entry_seq": 0, "to_entry_seq": 999,
+  "receipts": [
+    {"receipt_no": "DUP", "type": "sale", "ref_id": "S100", "copies": 1, "net_price": 10},
+    {"receipt_no": "DUP", "type": "sale", "ref_id": "S101", "copies": 1, "net_price": 10}
+  ]
+}'
+# → 400 {"detail": "整批拒绝：回单号批内重复：DUP；区间终点 999 超出当前最大入账序号 8（区间越界）"}
+```
+
+对账报告响应示例：
+
+```json
+{
+  "reconciliation_id": 1,
+  "batch_no": "RECON-CHX-2026-11",
+  "channel": "CH-X",
+  "from_entry_seq": 0,
+  "to_entry_seq": 8,
+  "entry_seq_from": 1,
+  "entry_seq_to": 8,
+  "snapshot_max_entry_seq": 8,
+  "created_at": "2026-10-05T12:00:00+00:00",
+  "counts": {
+    "receipts": 3, "internal": 6,
+    "matched": 2, "value_mismatch": 0, "channel_extra": 1, "internal_missing": 4
+  },
+  "lines": [
+    {
+      "seq": 1, "status": "matched", "type": "sale", "type_label": "销售",
+      "receipt_no": "RCP-001", "ref_id": "S100", "entry_seq": 1,
+      "copies_match": true, "net_price_match": true, "reason": null,
+      "channel":  {"receipt_no": "RCP-001", "copies": 1200, "net_price": "33.33", "amount_cents": 3999600},
+      "internal": {"entry_seq": 1, "copies": 1200, "net_price": "33.33", "amount_cents": 3999600}
+    },
+    {
+      "seq": 3, "status": "matched", "type": "refund", "type_label": "退款",
+      "receipt_no": "RCP-002", "ref_id": "RF100", "entry_seq": 2,
+      "copies_match": true, "net_price_match": true, "reason": null,
+      "channel":  {"receipt_no": "RCP-002", "copies": 250, "net_price": "33.33", "amount_cents": 833250},
+      "internal": {"entry_seq": 2, "copies": 250, "net_price": "33.33", "amount_cents": 833250}
+    },
+    {
+      "seq": 6, "status": "internal_missing", "type": "refund", "type_label": "退款",
+      "receipt_no": null, "ref_id": "RF102", "entry_seq": 7,
+      "copies_match": null, "net_price_match": null, "reason": null,
+      "channel": null,
+      "internal": {"entry_seq": 7, "copies": 100, "net_price": "33.33", "amount_cents": 333300}
+    },
+    {
+      "seq": 7, "status": "channel_extra", "type": "sale", "type_label": "销售",
+      "receipt_no": "RCP-003", "ref_id": "S999", "entry_seq": null,
+      "copies_match": null, "net_price_match": null, "reason": "not_found",
+      "channel":  {"receipt_no": "RCP-003", "copies": 1, "net_price": "10", "amount_cents": 1000},
+      "internal": null
+    }
+  ],
+  "channel_summary": {
+    "sales": {"count": 2, "copies": 1201, "amount_cents": 4000600},
+    "refunds": {"count": 1, "copies": 250, "amount_cents": 833250},
+    "net_amount_cents": 3167350
+  },
+  "internal_summary": {
+    "sales": {"count": 3, "copies": 1215, "amount_cents": 4029600},
+    "refunds": {"count": 3, "copies": 360, "amount_cents": 1199880},
+    "net_amount_cents": 2829720
+  }
+}
+```
+
+字段说明：
+
+- `counts`：`receipts` 回单笔数（含空回单）、`internal` 区间内原销售+原退款笔数，及四类结论计数。
+- `lines[].status`：`matched` / `value_mismatch` / `channel_extra` / `internal_missing`；`type_label` 为中文类型。行序：内部基准行按 `entry_seq` 升序，`channel_extra` 行按回单提交顺序追加。
+- `lines[].channel` / `lines[].internal`：双方原值（册数、每册净价、金额分；内部侧附 `entry_seq`，渠道侧附 `receipt_no`）；无对侧时为 `null`。
+- `lines[].copies_match` / `net_price_match`：仅 `matched`/`value_mismatch` 行有布尔值，其余为 `null`。
+- `lines[].reason`（仅 `channel_extra`）：`not_found`（内部无此销售/退款编号）、`kind_mismatch`（编号存在但销售/退款类型不符）、`not_in_interval`（同类型流水存在但入账序号越出本批区间）。
+- 金额（分）= 每册净价四舍五入到分 × 册数；`net_amount_cents = 销售金额 − 退款金额`，渠道侧与内部侧各自独立汇总。
+- 区间内的净价更正与价差反向流水**不出现在任何行中**；退款内部侧净价恒为原销售入账价。
+
+### 错误码（渠道对账）
+
+| 状态码 | 场景 |
+| --- | --- |
+| 400 | 整批拒绝：回单号批内重复 / 同一 `(type, ref_id)` 多次出现 / 区间非正长度 / 区间终点越界（`detail` 汇总全部原因，不落库） |
+| 404 | 按编号或批次号查询的对账报告不存在 |
+| 409 | 同批次号异内容重试（区间、渠道或回单内容不一致） |
+| 422 | 请求体校验失败（负数册数/净价、非法类型、编号为空、起点为负等） |
+
+
 ### 错误码（净价更正）
 
 | 状态码 | 场景 |
@@ -375,9 +525,21 @@ pip install -r requirements-dev.txt
 pytest tests/ -q
 ```
 
-覆盖：阶梯计提、分账余分补齐、退款跨段冲回与超退拦截、幂等重试与冲突、关账批次归属与报表不可改、付款结算（过期批次拒绝/超付拦截/幂等重放/负余额抵扣）、并发入账、关账与结算，作者分成版本（校验/幂等与全局冲突/版本查询/入账版本/旧销售退款按原版本分账/退出作者结算/并发变更与入账/旧库迁移），以及净价更正（各档未退册数差额与独立分账相减/正负差额/幂等与全局冲突/销售不存在·已全退·同价拒绝/更正后退款的价差反向流水与原字段不变/串联更正与全退逐作者归零/更正与反向进入下一批次且历史不改写/按更正编号查询/并发提交顺序/旧库迁移新流水类型）。
+覆盖：阶梯计提、分账余分补齐、退款跨段冲回与超退拦截、幂等重试与冲突、关账批次归属与报表不可改、付款结算（过期批次拒绝/超付拦截/幂等重放/负余额抵扣）、并发入账、关账与结算，作者分成版本（校验/幂等与全局冲突/版本查询/入账版本/旧销售退款按原版本分账/退出作者结算/并发变更与入账/旧库迁移），净价更正（各档未退册数差额与独立分账相减/正负差额/幂等与全局冲突/销售不存在·已全退·同价拒绝/更正后退款的价差反向流水与原字段不变/串联更正与全退逐作者归零/更正与反向进入下一批次且历史不改写/按更正编号查询/并发提交顺序/旧库迁移新流水类型），以及渠道对账（四类逐笔结论与双方原值/汇总、退款取原销售入账价、更正与反向不参与、空回单与空批次核漏报、重复回单号/重复内部流水/区间越界整批拒绝且不落库、非法数值 422、同批次号同内容重放（顺序无关）与异内容 409、报告冻结不受后续流水影响、不改写销售/退款/关账且不占入账序号、区间窗口与多报原因、批次列表/渠道过滤/404、并发提交）。
 
-## 本轮变动（v1.3.0）
+## 本轮变动（v1.4.0）
+
+- **新增渠道对账**：`POST /reconciliations` 以全局唯一批次号、入账序号区间 `(from_entry_seq, to_entry_seq]`、渠道与逐笔回单提交；`GET /reconciliations`（可 `?channel=` 过滤）、`GET /reconciliations/{id}`、`GET /reconciliations/by-batch/{batch_no}` 查询冻结报告。
+- **核对口径**：区间内仅原销售与原退款参与，净价更正与价差反向流水不参与；退款内部侧册数为退款册数、每册净价恒取原销售入账价（不受后续更正影响）。
+- **逐笔结论与双方原值/汇总**：`matched` / `value_mismatch`（`copies_match`、`net_price_match` 指出差异项）/ `channel_extra`（`reason`：`not_found` / `kind_mismatch` / `not_in_interval`）/ `internal_missing`；每行附渠道侧与内部侧册数、净价、金额，顶层附双方销售/退款笔数、册数、金额及净额。
+- **空回单核漏报**：回单列表可为空（整批核查内部漏报）；单笔允许 `copies=0` 的空回单，按类型与内部编号参与匹配。
+- **整批拒绝**：同一 `(type, ref_id)` 多次出现、回单号批内重复、区间非正长度或终点越过当前最大入账序号 → 400（`detail` 汇总全部原因，不落库，修正后可同号重提）；数值/格式非法 → 422。
+- **快照与冻结**：核对与保存在同一数据快照（全局锁 + `BEGIN IMMEDIATE` 单事务）中完成；成功报告整体 JSON 落库后冻结，后续补录、退款、更正均不改旧报告。
+- **幂等**：同批次号同内容（回单顺序无关）重试返回原冻结报告（200），异内容 409。
+- **只读、不改写、兼容**：对账仅读取销售/退款并写入独立 `reconciliations` 表；不改写销售、退款、关账与付款，不占用入账序号、不影响关账批次；既有接口字段与状态码保持不变。
+- **存储**：新增 `reconciliations` 表（`CREATE TABLE IF NOT EXISTS`，启动自动建表，无旧库迁移动作）。启动方式（`uvicorn app.main:app` / Docker）不变。
+
+## 历史变动（v1.3.0）
 
 - **新增销售净价更正**：`POST /price-corrections`（更正编号全局唯一、幂等），`GET /price-corrections/{correction_id}` 按更正编号查询，`GET /price-corrections` 列表（可 `?sale_id=` 过滤）。
 - **差额口径**：按**原销售阶梯费率与入账时分成版本**，仅对各档**未退册数**计算新旧每册净价的版税差额（四舍五入到分）；逐作者差额为"新价未退总额分账 − 旧价未退总额分账"（两个总额各自整体分账后相减）。旧价取当前更正价，支持多次串联更正。
@@ -400,11 +562,13 @@ pytest tests/ -q
 
 ```
 app/
-  main.py     # FastAPI 路由
-  ledger.py   # 核心账务逻辑（计提/分账/退款/关账）
-  db.py       # SQLite 连接与 schema 初始化
-  schemas.py  # 请求模型与校验
+  main.py            # FastAPI 路由
+  ledger.py          # 核心账务逻辑（计提/分账/退款/更正/关账/付款）
+  reconciliation.py  # 渠道逐笔对账（快照核对、冻结报告、幂等）
+  db.py              # SQLite 连接与 schema 初始化
+  schemas.py         # 请求模型与校验
 tests/test_api.py
+tests/test_reconciliation.py
 examples/demo.sh
 Dockerfile / docker-compose.yml
 ```

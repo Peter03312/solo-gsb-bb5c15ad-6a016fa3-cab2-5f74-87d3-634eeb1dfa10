@@ -131,3 +131,55 @@ class PaymentIn(BaseModel):
     close_id: int = Field(gt=0)
     payment_id: str = Field(min_length=1, max_length=128)
     amount_cents: int = Field(gt=0)
+
+
+class ReconciliationReceiptIn(BaseModel):
+    """渠道逐笔回单。
+
+    - receipt_no 批内唯一；ref_id 为内部销售/退款流水编号；
+    - type 取 "sale"/"refund"（兼容中文 "销售"/"退款"）；
+    - copies 非负整数：0 表示空回单（仍按 (type, ref_id) 参与核漏）；
+    - net_price 非负每册净价；退款以原销售入账价核对。
+    """
+
+    receipt_no: str = Field(min_length=1, max_length=128)
+    type: str
+    ref_id: str = Field(min_length=1, max_length=128)
+    copies: int = Field(ge=0)
+    net_price: Decimal = Field(ge=0, description="每册净价（元，非负）")
+
+    @field_validator("net_price", mode="before")
+    @classmethod
+    def _price(cls, v):
+        return _norm_decimal(v)
+
+    @field_validator("type", mode="before")
+    @classmethod
+    def _type(cls, v):
+        if v in ("销售", "退款"):
+            v = "sale" if v == "销售" else "refund"
+        return v
+
+    @model_validator(mode="after")
+    def _check(self):
+        if self.type not in ("sale", "refund"):
+            raise ValueError("回单类型必须为 sale 或 refund（销售/退款）")
+        if not self.net_price.is_finite():
+            raise ValueError("净价必须为有限数值")
+        return self
+
+
+class ReconciliationIn(BaseModel):
+    """渠道对账提交：全局唯一批次号 + 入账序号区间 (from_entry_seq, to_entry_seq] +
+    渠道逐笔回单（可为空列表，空回单批次用于核查渠道漏报的内部流水）。
+
+    - 只以区间内原销售与退款流水为准；净价更正与价差反向流水不参与；
+    - 区间必须为正整数长度、终点不超过当前最大入账序号，否则整批拒绝（400）；
+    - 回单号批内重复、同一 (type, ref_id) 多次出现 → 整批拒绝（400）。
+    """
+
+    batch_no: str = Field(min_length=1, max_length=128)
+    channel: str = Field(min_length=1, max_length=128, description="渠道标识")
+    from_entry_seq: int = Field(ge=0, description="入账序号区间起点（不含）")
+    to_entry_seq: int = Field(ge=1, description="入账序号区间终点（含）")
+    receipts: list[ReconciliationReceiptIn] = Field(default_factory=list)
